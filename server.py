@@ -10,7 +10,7 @@ import json
 import base64
 from flask import Flask, jsonify, render_template_string, request
 
-from conso_client import ConsoClient, PLATFORM_PRESETS, ACCOUNTS_PATH, CONFIG_PATH, GITHUB_PAT, GITHUB_REPO
+from conso_client import ConsoClient, PLATFORM_PRESETS, ACCOUNTS_PATH, CONFIG_PATH
 
 app = Flask(__name__)
 
@@ -24,42 +24,44 @@ def add_cors_headers(response):
 
 # Country flags
 COUNTRY_FLAGS = {
-    "US": "🇺🇸",
     "NL": "🇳🇱",
     "GB": "🇬🇧",
     "JP": "🇯🇵",
     "DE": "🇩🇪",
     "ES": "🇪🇸",
-    "PL": "🇵🇱"
+    "PL": "🇵🇱",
+    "US": "🇺🇸"
 }
 
 def get_country_flag(country):
     return COUNTRY_FLAGS.get(country, "🇺🇸")
 
+GITHUB_PAT = os.environ.get("GITHUB_PAT", "")
+GITHUB_REPO = os.environ.get("GITHUB_REPO", "ABMDrop/conso-zap2")
+
 def load_matrix_accounts():
     # 1. Fetch live persistent tokens from GitHub vault branch
-    if GITHUB_PAT:
-        try:
-            url = f"https://api.github.com/repos/{GITHUB_REPO}/contents/accounts.json?ref=vault"
-            headers = {
-                "Authorization": f"token {GITHUB_PAT}",
-                "Accept": "application/vnd.github.v3+json"
-            }
-            r = requests.get(url, headers=headers, timeout=5)
-            if r.status_code == 200:
-                content_b64 = r.json().get("content", "")
-                raw = base64.b64decode(content_b64).decode("utf-8")
-                accs = json.loads(raw)
-                if accs:
-                    try:
-                        with open(ACCOUNTS_PATH, "w", encoding="utf-8") as f:
-                            f.write(raw)
-                    except Exception:
-                        pass
-                    print(f"[OK] Successfully loaded {len(accs)} accounts from Persistent GitHub Cloud Vault (vault branch).")
-                    return accs
-        except Exception as e:
-            print(f"[!] Warning: Could not fetch from cloud vault: {e}")
+    try:
+        url = f"https://api.github.com/repos/{GITHUB_REPO}/contents/accounts.json?ref=vault"
+        headers = {
+            "Authorization": f"token {GITHUB_PAT}",
+            "Accept": "application/vnd.github.v3+json"
+        }
+        r = requests.get(url, headers=headers, timeout=8)
+        if r.status_code == 200:
+            content_b64 = r.json().get("content", "")
+            raw = base64.b64decode(content_b64).decode("utf-8")
+            accs = json.loads(raw)
+            if accs:
+                try:
+                    with open(ACCOUNTS_PATH, "w", encoding="utf-8") as f:
+                        f.write(raw)
+                except Exception:
+                    pass
+                print(f"[OK] Successfully loaded {len(accs)} accounts from Persistent GitHub Cloud Vault (vault branch).")
+                return accs
+    except Exception as e:
+        print(f"[!] Warning: Could not fetch from cloud vault: {e}")
 
     # 2. Fallback to local accounts.json
     if os.path.exists(ACCOUNTS_PATH):
@@ -105,7 +107,6 @@ matrix_state = {
 }
 
 matrix_lock = threading.Lock()
-running_workers = {}
 
 def account_worker(acc_data, initial_delay=0):
     global matrix_state
@@ -114,64 +115,50 @@ def account_worker(acc_data, initial_delay=0):
     country = acc_data.get("country", "US")
     flag = get_country_flag(country)
 
+    print(f"[*] Initializing Worker for {flag} {name} (Initial Stagger Delay: {initial_delay}s)...")
     if initial_delay > 0:
         time.sleep(initial_delay)
 
     client = ConsoClient(account_data=acc_data)
+    p = None
+
+    try:
+        p = client.get_profile()
+        if not p:
+            client.refresh_session()
+            p = client.get_profile()
+        status_msg = "active"
+    except Exception as e:
+        status_msg = f"auth_err: {str(e)[:30]}"
+        print(f"[!] Worker Auth Error for {name}: {e}")
+
+    with matrix_lock:
+        if acc_id in matrix_state["accounts"]:
+            acc_s = matrix_state["accounts"][acc_id]
+            acc_s["status"] = status_msg
+            if p:
+                acc_s["total_zaps"] = float(p.get("total_zaps", 0) or 0.0)
+                today_utc = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%d")
+                if p.get("daily_zaps_date") == today_utc:
+                    acc_s["daily_zaps"] = float(p.get("daily_zaps_earned", 0) or 0.0)
+                else:
+                    acc_s["daily_zaps"] = 0.0
+                acc_s["streak"] = p.get("current_streak", 0) or 1
+                acc_s["boost"] = p.get("boost_factor", 1.05) or 1.05
+
+    platform_idx = random.randint(0, len(PLATFORM_PRESETS) - 1)
 
     while True:
         try:
-            # Check if account has credentials injected
+            # Check if credentials are injected
             if not client.refresh_token and not client.access_token:
                 with matrix_lock:
                     if acc_id in matrix_state["accounts"]:
                         matrix_state["accounts"][acc_id]["status"] = "waiting_for_session"
                 time.sleep(10)
-                # Re-check updated file/state
-                with open(ACCOUNTS_PATH, "r", encoding="utf-8") as f:
-                    updated_accs = json.load(f)
-                for a in updated_accs:
-                    if a.get("id") == acc_id:
-                        if a.get("refresh_token"):
-                            client.refresh_token = a.get("refresh_token")
-                            client.access_token = a.get("access_token")
-                            client.email = a.get("email")
-                            client.account_name = a.get("name")
-                            break
                 continue
 
-            # Authenticate & fetch profile
-            p = None
-            try:
-                p = client.get_profile()
-                if not p:
-                    client.refresh_session()
-                    p = client.get_profile()
-                status_msg = "active"
-            except Exception as e:
-                status_msg = f"auth_err: {str(e)[:30]}"
-                print(f"[!] Worker Auth Error for {name}: {e}")
-
-            rank = client.get_my_rank()
-
-            with matrix_lock:
-                if acc_id in matrix_state["accounts"]:
-                    acc_s = matrix_state["accounts"][acc_id]
-                    acc_s["status"] = status_msg
-                    if p:
-                        acc_s["total_zaps"] = float(p.get("total_zaps", 0) or 0.0)
-                        today_utc = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%d")
-                        if p.get("daily_zaps_date") == today_utc:
-                            acc_s["daily_zaps"] = float(p.get("daily_zaps_earned", 0) or 0.0)
-                        else:
-                            acc_s["daily_zaps"] = 0.0
-                        acc_s["streak"] = p.get("current_streak", 0) or 1
-                        acc_s["boost"] = p.get("boost_factor", 1.05) or 1.05
-                        acc_s["email"] = p.get("email", client.email)
-                    if rank:
-                        acc_s["rank"] = rank
-
-            # Auto-claim daily check-in (+2 Zaps)
+            # 1. Auto-claim daily check-in (+2 Zaps) on new UTC day
             try:
                 if client.config.get("auto_claim_daily_checkin", True):
                     daily_claims = client.get_todays_missions()
@@ -179,28 +166,49 @@ def account_worker(acc_data, initial_delay=0):
                         ok, _ = client.claim_daily_mission("daily-checkin-v1")
                         if ok:
                             print(f"[✓] {flag} {name}: Auto-claimed daily check-in (+2 Zaps)")
-            except Exception:
+            except Exception as e:
                 pass
+
+            profile = client.get_profile()
+            rank = client.get_my_rank()
+
+            with matrix_lock:
+                acc_s = matrix_state["accounts"][acc_id]
+                if profile:
+                    acc_s["total_zaps"] = float(profile.get("total_zaps", 0) or 0.0)
+                    today_utc = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%d")
+                    if profile.get("daily_zaps_date") == today_utc:
+                        acc_s["daily_zaps"] = float(profile.get("daily_zaps_earned", 0) or 0.0)
+                    else:
+                        acc_s["daily_zaps"] = 0.0
+                    acc_s["streak"] = profile.get("current_streak", 0) or 1
+                    acc_s["boost"] = profile.get("boost_factor", 1.05) or 1.05
+                    if profile.get("consoname"):
+                        acc_s["name"] = profile.get("consoname")
+                if rank:
+                    acc_s["rank"] = rank
 
             daily_cap = get_daily_account_cap(acc_id, client.config)
             with matrix_lock:
                 acc_s["daily_cap"] = daily_cap
 
-            # Daily Cap Safety Check
-            if acc_s.get("daily_zaps", 0.0) >= daily_cap:
+            # 2. Daily Cap Safety Check
+            if acc_s["daily_zaps"] >= daily_cap:
                 with matrix_lock:
                     acc_s["status"] = "daily_cap_reached"
                     acc_s["is_sleeping"] = False
                     acc_s["next_sync_target"] = int(time.time() + 900)
+                print(f"[★] {flag} {name} Daily target reached: {acc_s['daily_zaps']:.2f}/{daily_cap:.2f} Zaps. Waiting 15m.")
                 time.sleep(900)
                 continue
 
-            # Sleep window check
+            # 3. Human Night Sleep Window Check
             if client.is_in_sleep_window():
                 with matrix_lock:
                     acc_s["status"] = "human_sleep_mode"
                     acc_s["is_sleeping"] = True
                     acc_s["next_sync_target"] = int(time.time() + 1200)
+                print(f"[💤] {flag} {name} in sleep window (inactive UTC night hours). Resting 20 mins.")
                 time.sleep(1200)
                 continue
 
@@ -208,8 +216,10 @@ def account_worker(acc_data, initial_delay=0):
                 acc_s["is_sleeping"] = False
                 acc_s["status"] = "active"
 
-            # Simulate turn on rotating platform
-            preset = random.choice(PLATFORM_PRESETS)
+            # 4. Simulate turn on rotating platform
+            preset = PLATFORM_PRESETS[platform_idx % len(PLATFORM_PRESETS)]
+            platform_idx += 1
+
             result = client.simulate_prompt(preset)
 
             if result["ok"]:
@@ -221,6 +231,7 @@ def account_worker(acc_data, initial_delay=0):
                     acc_s["last_platform"] = preset["platform"].capitalize()
                     acc_s["last_credited"] = credited
 
+                    # Global matrix history
                     history_entry = {
                         "time": now_str,
                         "account": f"{flag} {name}",
@@ -235,198 +246,125 @@ def account_worker(acc_data, initial_delay=0):
                     if len(matrix_state["history"]) > 60:
                         matrix_state["history"].pop()
 
-                print(f"[+] [{now_str}] {flag} {name}: +{credited:.2f} Zaps ({preset['platform'].capitalize()})")
+                    # Refresh stats
+                    p = client.get_profile()
+                    if p:
+                        acc_s["total_zaps"] = float(p.get("total_zaps", 0) or 0.0)
+                        today_utc = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%d")
+                        if p.get("daily_zaps_date") == today_utc:
+                            acc_s["daily_zaps"] = float(p.get("daily_zaps_earned", 0) or 0.0)
+                        else:
+                            acc_s["daily_zaps"] = 0.0
+                    r = client.get_my_rank()
+                    if r:
+                        acc_s["rank"] = r
 
-            # Humanized delay between turns (18 - 30 minutes)
-            min_sec = client.config.get("min_interval_sec", 1100)
-            max_sec = client.config.get("max_interval_sec", 1800)
-            sleep_duration = random.randint(min_sec, max_sec)
+                print(f"[✓] {flag} {name} synced on {preset['platform'].upper()} (+{credited:.2f} Zaps) | Total: {acc_s['total_zaps']:.2f} | Rank: #{acc_s.get('rank')}")
+            else:
+                print(f"[!] {flag} {name} sync note: {result.get('error')}")
+
+            # 5. Enforce 18-30 mins natural human delay
+            min_delay = client.config.get("min_interval_sec", 1100)
+            max_delay = client.config.get("max_interval_sec", 1800)
+            delay = random.randint(min_delay, max_delay)
 
             with matrix_lock:
-                acc_s["next_sync_target"] = int(time.time() + sleep_duration)
+                acc_s["next_sync_target"] = int(time.time() + delay)
 
-            time.sleep(sleep_duration)
+            mins = delay // 60
+            secs = delay % 60
+            print(f"[*] {flag} {name}: Sleeping for {mins}m {secs}s before next prompt...")
+            time.sleep(delay)
 
         except Exception as e:
-            print(f"[!] Error in worker {acc_id}: {e}")
-            time.sleep(60)
+            err_str = str(e)
+            print(f"[!] Worker exception ({flag} {name}): {err_str}")
+            # Dynamic Self-Healing: If auth failed, reload latest tokens from cloud vault/disk
+            if "Session Refresh Failed" in err_str or "JWT expired" in err_str or "401" in err_str or "auth_err" in err_str:
+                try:
+                    reloaded_accs = load_matrix_accounts()
+                    for ra in reloaded_accs:
+                        if ra.get("id") == acc_id and ra.get("refresh_token") != client.refresh_token:
+                            client.refresh_token = ra.get("refresh_token")
+                            if ra.get("access_token"):
+                                client.access_token = ra.get("access_token")
+                            print(f"[🔄] Self-healed {flag} {name} with fresh token from vault!")
+                            with matrix_lock:
+                                if acc_id in matrix_state["accounts"]:
+                                    matrix_state["accounts"][acc_id]["status"] = "active"
+                            break
+                except Exception as ex:
+                    print(f"[!] Self-healing error for {name}: {ex}")
+            with matrix_lock:
+                if acc_id in matrix_state["accounts"]:
+                    matrix_state["accounts"][acc_id]["next_sync_target"] = int(time.time() + 180)
+            time.sleep(30)
 
-def start_matrix():
-    accounts = load_matrix_accounts()
-    print(f"[*] Starting Conso Zap Cluster 2 with {len(accounts)} slots...")
+# Self Keep-Alive Daemon
+def pinger_loop():
+    print("[*] Starting Cluster 2 Keep-Alive Daemon...")
+    while True:
+        try:
+            r = requests.get("https://conso-zap2.onrender.com/health", timeout=15)
+            if r.status_code == 200:
+                print("[✓] Self keep-alive ping successful (Render stays awake).")
+        except Exception:
+            pass
+        time.sleep(240)  # Ping every 4 minutes (Render idle limit is 15m)
 
-    with matrix_lock:
-        matrix_state["summary"]["total_nodes"] = len(accounts)
-        for acc in accounts:
-            acc_id = acc["id"]
-            country = acc.get("country", "US")
-            proxy_str = acc.get("proxy", "")
-            assigned_ip = proxy_str.split("@")[-1] if "@" in proxy_str else (proxy_str or "Cloud Direct")
-
-            matrix_state["accounts"][acc_id] = {
-                "id": acc_id,
-                "name": acc.get("name", acc_id),
-                "email": acc.get("email", ""),
-                "country": country,
-                "flag": get_country_flag(country),
-                "proxy": assigned_ip,
-                "status": "active" if acc.get("refresh_token") else "waiting_for_session",
-                "total_zaps": 0.0,
-                "daily_zaps": 0.0,
-                "streak": 1,
-                "boost": 1.05,
-                "rank": None,
-                "last_sync": "--:--:--",
-                "last_platform": "--",
-                "last_credited": 0.0,
-                "is_sleeping": False,
-                "next_sync_target": 0
-            }
-
-    # Staggered launch across slots
-    stagger = 15
-    for acc in accounts:
-        acc_id = acc["id"]
-        matrix_state["accounts"][acc_id]["next_sync_target"] = int(time.time() + stagger)
-        t = threading.Thread(target=account_worker, args=(acc, stagger), daemon=True)
-        running_workers[acc_id] = t
-        t.start()
-        stagger += 35
-
-MATRIX_INITIALIZED = False
-MATRIX_INIT_LOCK = threading.Lock()
+matrix_started = False
+matrix_start_lock = threading.Lock()
 
 def ensure_matrix_started():
-    global MATRIX_INITIALIZED
-    if MATRIX_INITIALIZED:
-        return
-    with MATRIX_INIT_LOCK:
-        if MATRIX_INITIALIZED:
-            return
-        start_matrix()
-        MATRIX_INITIALIZED = True
+    global matrix_started
+    with matrix_start_lock:
+        if not matrix_started:
+            matrix_started = True
+            accounts = load_matrix_accounts()
+            print(f"[✓] Initializing {len(accounts)}-Account Golden Matrix Cluster 2 Pool...")
 
-ensure_matrix_started()
+            # Pre-populate state for all accounts so dashboard displays full roster immediately
+            with matrix_lock:
+                matrix_state["summary"]["total_nodes"] = len(accounts)
+                for idx, acc in enumerate(accounts):
+                    aid = acc["id"]
+                    country = acc.get("country", "US")
+                    proxy_str = acc.get("proxy", "")
+                    assigned_ip = proxy_str.split("@")[-1] if "@" in proxy_str else (proxy_str or "Cloud Direct")
+                    matrix_state["accounts"][aid] = {
+                        "id": aid,
+                        "name": acc.get("name", aid),
+                        "email": acc.get("email", ""),
+                        "country": country,
+                        "flag": get_country_flag(country),
+                        "proxy": assigned_ip,
+                        "status": "staggered_queue" if idx > 0 else "initializing",
+                        "total_zaps": 0.0,
+                        "daily_zaps": 0.0,
+                        "daily_cap": get_daily_account_cap(aid),
+                        "rank": "N/A",
+                        "streak": 1,
+                        "boost": 1.05,
+                        "is_sleeping": False,
+                        "next_sync_target": int(time.time() + (idx * 30) + 15),
+                        "last_sync": "Starting up",
+                        "last_platform": "N/A",
+                        "last_credited": 0.0
+                    }
 
-# ----------------- FLASK ROUTES -----------------
+            # Stagger launch by 30 seconds per account
+            stagger_step = 30
+            for idx, acc in enumerate(accounts):
+                stagger_delay = idx * stagger_step
+                t = threading.Thread(target=account_worker, args=(acc, stagger_delay), daemon=True)
+                t.start()
 
-@app.route("/")
-def dashboard():
-    ensure_matrix_started()
-    return render_template_string(HTML_TEMPLATE)
+            # Start keep-alive daemon
+            tp = threading.Thread(target=pinger_loop, daemon=True)
+            tp.start()
+            print(f"[✓] All {len(accounts)} Matrix workers & keep-alive daemon active for Cluster 2!")
 
-@app.route("/health")
-def health():
-    ensure_matrix_started()
-    with matrix_lock:
-        tot = sum(float(a.get("total_zaps", 0)) for a in matrix_state["accounts"].values())
-        day = sum(float(a.get("daily_zaps", 0)) for a in matrix_state["accounts"].values())
-        active_cnt = sum(1 for a in matrix_state["accounts"].values() if a.get("status") in ("active", "daily_cap_reached"))
-        total_accs = len(matrix_state["accounts"])
-        matrix_state["summary"]["total_zaps"] = round(tot, 2)
-        matrix_state["summary"]["daily_zaps"] = round(day, 2)
-        matrix_state["summary"]["active_nodes"] = active_cnt
-        matrix_state["summary"]["total_nodes"] = total_accs
-        target_sum = sum(float(a.get("daily_cap", 32.5)) for a in matrix_state["accounts"].values())
-        matrix_state["summary"]["target_daily"] = round(target_sum, 1)
-
-        state_copy = json.loads(json.dumps(matrix_state))
-        legacy_state = state_copy["accounts"].get("acc_01", {})
-
-        return jsonify({
-            "ok": True,
-            "status": "ok",
-            "service": "conso-zap-cluster2",
-            "cluster": "Cluster 2 (Oxylabs 5 Dedicated Slots)",
-            "matrix": state_copy,
-            "state": legacy_state,
-            "accounts": state_copy["accounts"],
-            "active_nodes": active_cnt,
-            "total_nodes": total_accs
-        }), 200
-
-@app.route("/api/status")
-def api_status():
-    ensure_matrix_started()
-    with matrix_lock:
-        state_copy = json.loads(json.dumps(matrix_state))
-    return jsonify(state_copy), 200
-
-@app.route("/api/add_account", methods=["POST", "OPTIONS"])
-def api_add_account():
-    if request.method == "OPTIONS":
-        return jsonify({"ok": True}), 200
-
-    data = request.json or {}
-    email = data.get("email", "").strip()
-    refresh_token = data.get("refresh_token", "").strip()
-    access_token = data.get("access_token", "").strip()
-    name = data.get("name", "").strip()
-    slot_id = data.get("slot_id", "").strip()
-
-    if not refresh_token:
-        return jsonify({"ok": False, "error": "refresh_token is required"}), 400
-
-    ensure_matrix_started()
-
-    # Load current accounts
-    with open(ACCOUNTS_PATH, "r", encoding="utf-8") as f:
-        accounts = json.load(f)
-
-    target_slot = None
-    if slot_id:
-        for acc in accounts:
-            if acc["id"] == slot_id:
-                target_slot = acc
-                break
-    
-    # Auto-assign to first empty or matching slot
-    if not target_slot:
-        for acc in accounts:
-            if acc.get("email") == email or not acc.get("refresh_token"):
-                target_slot = acc
-                break
-
-    if not target_slot:
-        return jsonify({"ok": False, "error": "All 5 Oxylabs slots are currently occupied!"}), 400
-
-    # Inject credentials
-    target_slot["refresh_token"] = refresh_token
-    if access_token:
-        target_slot["access_token"] = access_token
-    if email:
-        target_slot["email"] = email
-    if name:
-        target_slot["name"] = name
-    else:
-        target_slot["name"] = email.split("@")[0] if email else target_slot["name"]
-
-    # Save to disk
-    with open(ACCOUNTS_PATH, "w", encoding="utf-8") as f:
-        json.dump(accounts, f, indent=2)
-
-    # Trigger force sync to GitHub vault branch
-    c = ConsoClient(account_data=target_slot)
-    c.refresh_token = refresh_token
-    c.access_token = access_token
-    c.save_config(force=True)
-
-    # Update in-memory state
-    with matrix_lock:
-        acc_s = matrix_state["accounts"].get(target_slot["id"])
-        if acc_s:
-            acc_s["email"] = target_slot["email"]
-            acc_s["name"] = target_slot["name"]
-            acc_s["status"] = "active"
-
-    return jsonify({
-        "ok": True,
-        "message": f"Successfully synced {target_slot['name']} to Slot {target_slot['id']}!",
-        "slot": target_slot["id"],
-        "proxy": target_slot.get("proxy", "")
-    }), 200
-
-# ----------------- CYBERPUNK UI TEMPLATE -----------------
+# ----------------- CYBERPUNK GOLDEN MATRIX UI TEMPLATE -----------------
 HTML_TEMPLATE = """
 <!DOCTYPE html>
 <html lang="en">
@@ -465,7 +403,7 @@ HTML_TEMPLATE = """
         <!-- Top Command Header -->
         <div class="card">
             <div class="header">
-                <h1 id="header_title">⚡ CONSO 5-ACCOUNT GOLDEN MATRIX COMMAND CENTER</h1>
+                <h1 id="header_title">⚡ CONSO 5-ACCOUNT GOLDEN MATRIX COMMAND CENTER (CLUSTER 2)</h1>
                 <span class="badge badge-active" id="header_badge">5 OXYLABS SLOTS ONLINE • 24/7 CLOUD</span>
             </div>
 
@@ -583,7 +521,7 @@ HTML_TEMPLATE = """
                     // Dynamic Titles & Badges
                     document.title = `Conso ${totalNodes}-Account Golden Matrix Hub (Cluster 2)`;
                     let headerTitleEl = document.getElementById("header_title");
-                    if (headerTitleEl) headerTitleEl.innerHTML = `⚡ CONSO ${totalNodes}-ACCOUNT GOLDEN MATRIX COMMAND CENTER`;
+                    if (headerTitleEl) headerTitleEl.innerHTML = `⚡ CONSO ${totalNodes}-ACCOUNT GOLDEN MATRIX COMMAND CENTER (CLUSTER 2)`;
                     let headerBadgeEl = document.getElementById("header_badge");
                     if (headerBadgeEl) headerBadgeEl.innerText = `${totalNodes} OXYLABS SLOTS ONLINE • 24/7 CLOUD`;
 
@@ -599,7 +537,7 @@ HTML_TEMPLATE = """
                         let acc = m.accounts[aid];
                         totalZ += Number(acc.total_zaps || 0);
                         dailyZ += Number(acc.daily_zaps || 0);
-                        if (acc.status === "active") activeCount++;
+                        if (acc.status === "active" || acc.status === "staggered_queue") activeCount++;
 
                         let cap = Number(acc.daily_cap || 33.0);
                         let pct = Math.min(100, Math.round(((acc.daily_zaps || 0) / cap) * 100));
@@ -660,6 +598,117 @@ HTML_TEMPLATE = """
 </body>
 </html>
 """
+
+@app.before_request
+def before_req():
+    ensure_matrix_started()
+
+@app.route("/")
+def index():
+    return render_template_string(HTML_TEMPLATE)
+
+@app.route("/health")
+def health():
+    with matrix_lock:
+        tot = sum(float(a.get("total_zaps", 0)) for a in matrix_state["accounts"].values())
+        day = sum(float(a.get("daily_zaps", 0)) for a in matrix_state["accounts"].values())
+        total_accs = len(matrix_state["accounts"])
+        active_cnt = sum(1 for a in matrix_state["accounts"].values() if a.get("status") in ("active", "daily_cap_reached", "staggered_queue"))
+        matrix_state["summary"]["total_zaps"] = round(tot, 2)
+        matrix_state["summary"]["daily_zaps"] = round(day, 2)
+        matrix_state["summary"]["active_nodes"] = active_cnt
+        matrix_state["summary"]["total_nodes"] = total_accs
+        target_sum = sum(float(a.get("daily_cap", 32.5)) for a in matrix_state["accounts"].values())
+        matrix_state["summary"]["target_daily"] = round(target_sum, 1)
+
+        legacy_state = matrix_state["accounts"].get("acc_01", {})
+
+        return jsonify({
+            "ok": True,
+            "status": "ok",
+            "service": "conso-zap-cluster2",
+            "cluster": "Cluster 2 (Oxylabs 5 Dedicated Slots)",
+            "matrix": matrix_state,
+            "state": legacy_state,
+            "accounts": matrix_state["accounts"],
+            "active_nodes": active_cnt,
+            "total_nodes": total_accs
+        })
+
+@app.route("/api/add_account", methods=["POST", "OPTIONS"])
+def api_add_account():
+    if request.method == "OPTIONS":
+        return jsonify({"ok": True}), 200
+
+    data = request.json or {}
+    email = data.get("email", "").strip()
+    refresh_token = data.get("refresh_token", "").strip()
+    access_token = data.get("access_token", "").strip()
+    name = data.get("name", "").strip()
+    slot_id = data.get("slot_id", "").strip()
+
+    if not refresh_token:
+        return jsonify({"ok": False, "error": "refresh_token is required"}), 400
+
+    ensure_matrix_started()
+
+    with open(ACCOUNTS_PATH, "r", encoding="utf-8") as f:
+        accounts = json.load(f)
+
+    target_slot = None
+    if slot_id:
+        for acc in accounts:
+            if acc["id"] == slot_id:
+                target_slot = acc
+                break
+
+    if not target_slot:
+        for acc in accounts:
+            if acc.get("email") == email or not acc.get("refresh_token"):
+                target_slot = acc
+                break
+
+    if not target_slot:
+        return jsonify({"ok": False, "error": "All slots occupied"}), 400
+
+    target_slot["refresh_token"] = refresh_token
+    if access_token:
+        target_slot["access_token"] = access_token
+    if email:
+        target_slot["email"] = email
+    if name:
+        target_slot["name"] = name
+    else:
+        target_slot["name"] = email.split("@")[0] if email else target_slot["name"]
+
+    with open(ACCOUNTS_PATH, "w", encoding="utf-8") as f:
+        json.dump(accounts, f, indent=2)
+
+    with matrix_lock:
+        aid = target_slot["id"]
+        if aid in matrix_state["accounts"]:
+            matrix_state["accounts"][aid]["email"] = target_slot["email"]
+            matrix_state["accounts"][aid]["name"] = target_slot["name"]
+            matrix_state["accounts"][aid]["status"] = "active"
+
+    return jsonify({
+        "ok": True,
+        "message": f"Successfully synced {target_slot['name']} to Slot {target_slot['id']}",
+        "slot": target_slot["id"]
+    }), 200
+
+@app.route("/api/reload_accounts", methods=["GET", "POST"])
+def route_reload_accounts():
+    try:
+        accs = load_matrix_accounts()
+        with matrix_lock:
+            for acc in accs:
+                aid = acc["id"]
+                if aid in matrix_state["accounts"]:
+                    matrix_state["accounts"][aid]["status"] = "active"
+        return jsonify({"ok": True, "reloaded": len(accs)})
+    except Exception as e:
+        return jsonify({"ok": False, "error": str(e)}), 500
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=5000, debug=False)
