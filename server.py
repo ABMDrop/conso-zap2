@@ -284,13 +284,14 @@ def start_matrix():
             }
 
     # Staggered launch across slots
-    stagger = 0
+    stagger = 15
     for acc in accounts:
         acc_id = acc["id"]
+        matrix_state["accounts"][acc_id]["next_sync_target"] = int(time.time() + stagger)
         t = threading.Thread(target=account_worker, args=(acc, stagger), daemon=True)
         running_workers[acc_id] = t
         t.start()
-        stagger += 12
+        stagger += 35
 
 MATRIX_INITIALIZED = False
 MATRIX_INIT_LOCK = threading.Lock()
@@ -312,32 +313,37 @@ ensure_matrix_started()
 @app.route("/")
 def dashboard():
     ensure_matrix_started()
-    with matrix_lock:
-        state_copy = json.loads(json.dumps(matrix_state))
-    
-    total_zaps = sum(a.get("total_zaps", 0) for a in state_copy["accounts"].values())
-    daily_zaps = sum(a.get("daily_zaps", 0) for a in state_copy["accounts"].values())
-    active_cnt = sum(1 for a in state_copy["accounts"].values() if a.get("status") in ("active", "daily_cap_reached"))
-
-    state_copy["summary"]["total_zaps"] = round(total_zaps, 2)
-    state_copy["summary"]["daily_zaps"] = round(daily_zaps, 2)
-    state_copy["summary"]["active_nodes"] = active_cnt
-
-    return render_template_string(HTML_TEMPLATE, state=state_copy)
+    return render_template_string(HTML_TEMPLATE)
 
 @app.route("/health")
 def health():
     ensure_matrix_started()
     with matrix_lock:
+        tot = sum(float(a.get("total_zaps", 0)) for a in matrix_state["accounts"].values())
+        day = sum(float(a.get("daily_zaps", 0)) for a in matrix_state["accounts"].values())
+        active_cnt = sum(1 for a in matrix_state["accounts"].values() if a.get("status") in ("active", "daily_cap_reached"))
+        total_accs = len(matrix_state["accounts"])
+        matrix_state["summary"]["total_zaps"] = round(tot, 2)
+        matrix_state["summary"]["daily_zaps"] = round(day, 2)
+        matrix_state["summary"]["active_nodes"] = active_cnt
+        matrix_state["summary"]["total_nodes"] = total_accs
+        target_sum = sum(float(a.get("daily_cap", 32.5)) for a in matrix_state["accounts"].values())
+        matrix_state["summary"]["target_daily"] = round(target_sum, 1)
+
         state_copy = json.loads(json.dumps(matrix_state))
-    return jsonify({
-        "status": "ok",
-        "service": "conso-zap-cluster2",
-        "cluster": "Cluster 2 (Oxylabs 5 Dedicated Slots)",
-        "active_nodes": sum(1 for a in state_copy["accounts"].values() if a.get("status") in ("active", "daily_cap_reached")),
-        "total_nodes": len(state_copy["accounts"]),
-        "accounts": state_copy["accounts"]
-    }), 200
+        legacy_state = state_copy["accounts"].get("acc_01", {})
+
+        return jsonify({
+            "ok": True,
+            "status": "ok",
+            "service": "conso-zap-cluster2",
+            "cluster": "Cluster 2 (Oxylabs 5 Dedicated Slots)",
+            "matrix": state_copy,
+            "state": legacy_state,
+            "accounts": state_copy["accounts"],
+            "active_nodes": active_cnt,
+            "total_nodes": total_accs
+        }), 200
 
 @app.route("/api/status")
 def api_status():
@@ -425,242 +431,232 @@ HTML_TEMPLATE = """
 <!DOCTYPE html>
 <html lang="en">
 <head>
-  <meta charset="UTF-8">
-  <title>⚡ CONSO ZAP CLUSTER 2 - Oxylabs Farm</title>
-  <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
-  <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;600;800&family=Space+Grotesk:wght@500;700&display=swap" rel="stylesheet">
-  <style>
-    :root {
-      --bg: #090b10;
-      --card-bg: rgba(16, 21, 33, 0.85);
-      --border: rgba(56, 189, 248, 0.2);
-      --accent: #38bdf8;
-      --accent-glow: rgba(56, 189, 248, 0.35);
-      --gold: #fbbf24;
-      --green: #10b981;
-      --red: #ef4444;
-      --text: #f1f5f9;
-      --text-muted: #94a3b8;
-    }
-    * { margin:0; padding:0; box-sizing:border-box; }
-    body {
-      background: var(--bg);
-      color: var(--text);
-      font-family: 'Space Grotesk', sans-serif;
-      padding: 24px;
-      min-height: 100vh;
-      background-image: radial-gradient(circle at 50% 0%, rgba(56, 189, 248, 0.08), transparent 50%);
-    }
-    .header {
-      display: flex;
-      justify-content: space-between;
-      align-items: center;
-      margin-bottom: 24px;
-      padding-bottom: 16px;
-      border-bottom: 1px solid var(--border);
-    }
-    .title-group h1 {
-      font-size: 26px;
-      font-weight: 800;
-      background: linear-gradient(135deg, #38bdf8, #818cf8);
-      -webkit-background-clip: text;
-      -webkit-text-fill-color: transparent;
-      display: flex;
-      align-items: center;
-      gap: 12px;
-    }
-    .badge-cluster {
-      background: rgba(56, 189, 248, 0.15);
-      color: #38bdf8;
-      font-size: 12px;
-      padding: 4px 10px;
-      border-radius: 20px;
-      border: 1px solid rgba(56, 189, 248, 0.3);
-      font-family: 'JetBrains Mono', monospace;
-    }
-    .summary-grid {
-      display: grid;
-      grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
-      gap: 16px;
-      margin-bottom: 28px;
-    }
-    .stat-card {
-      background: var(--card-bg);
-      border: 1px solid var(--border);
-      border-radius: 12px;
-      padding: 18px;
-      backdrop-filter: blur(8px);
-    }
-    .stat-title {
-      font-size: 13px;
-      color: var(--text-muted);
-      margin-bottom: 6px;
-      text-transform: uppercase;
-      letter-spacing: 0.5px;
-    }
-    .stat-val {
-      font-size: 28px;
-      font-weight: 800;
-      color: #fff;
-      font-family: 'JetBrains Mono', monospace;
-    }
-    .grid-nodes {
-      display: grid;
-      grid-template-columns: repeat(auto-fit, minmax(320px, 1fr));
-      gap: 18px;
-      margin-bottom: 28px;
-    }
-    .node-card {
-      background: var(--card-bg);
-      border: 1px solid var(--border);
-      border-radius: 12px;
-      padding: 20px;
-      transition: all 0.2s ease;
-    }
-    .node-card:hover {
-      border-color: var(--accent);
-      box-shadow: 0 4px 20px var(--accent-glow);
-    }
-    .node-header {
-      display: flex;
-      justify-content: space-between;
-      align-items: center;
-      margin-bottom: 14px;
-      padding-bottom: 10px;
-      border-bottom: 1px solid rgba(255, 255, 255, 0.06);
-    }
-    .node-title {
-      font-size: 16px;
-      font-weight: 700;
-    }
-    .node-status {
-      font-size: 11px;
-      padding: 3px 8px;
-      border-radius: 12px;
-      font-family: 'JetBrains Mono', monospace;
-      font-weight: 600;
-    }
-    .status-active { background: rgba(16, 185, 129, 0.2); color: #10b981; border: 1px solid #10b981; }
-    .status-cap { background: rgba(251, 191, 36, 0.2); color: #fbbf24; border: 1px solid #fbbf24; }
-    .status-waiting { background: rgba(148, 163, 184, 0.2); color: #94a3b8; border: 1px solid #94a3b8; }
-    .data-row {
-      display: flex;
-      justify-content: space-between;
-      font-size: 13px;
-      margin-bottom: 8px;
-    }
-    .data-label { color: var(--text-muted); }
-    .data-val { font-family: 'JetBrains Mono', monospace; font-weight: 600; }
-    .terminal-section {
-      background: #05070a;
-      border: 1px solid var(--border);
-      border-radius: 12px;
-      padding: 16px;
-    }
-    .terminal-header {
-      font-size: 13px;
-      font-weight: 700;
-      color: var(--accent);
-      margin-bottom: 12px;
-      display: flex;
-      align-items: center;
-      gap: 8px;
-    }
-    .terminal-body {
-      max-height: 220px;
-      overflow-y: auto;
-      font-family: 'JetBrains Mono', monospace;
-      font-size: 12px;
-    }
-    .log-line {
-      margin-bottom: 6px;
-      color: #94a3b8;
-    }
-    .log-time { color: #64748b; }
-    .log-zap { color: #10b981; font-weight: 700; }
-  </style>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title id="page_title">Conso 5-Account Golden Matrix Hub (Cluster 2)</title>
+    <style>
+        body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; background: #090d16; color: #f8fafc; margin: 0; padding: 24px; }
+        .container { max-width: 1100px; margin: 0 auto; }
+        .card { background: #131b2e; border-radius: 16px; padding: 24px; box-shadow: 0 10px 30px rgba(0,0,0,0.5); border: 1px solid #1e293b; margin-bottom: 20px; }
+        .header { display: flex; justify-content: space-between; align-items: center; border-bottom: 1px solid #1e293b; padding-bottom: 16px; margin-bottom: 20px; }
+        h1 { margin: 0; font-size: 22px; color: #38bdf8; display: flex; align-items: center; gap: 10px; }
+        .badge { display: inline-block; padding: 4px 12px; border-radius: 20px; font-size: 11px; font-weight: 700; text-transform: uppercase; }
+        .badge-active { background: #064e3b; color: #34d399; }
+        .badge-sleep { background: #1e1b4b; color: #a5b4fc; }
+        .badge-cap { background: #713f12; color: #fde047; }
+        .badge-err { background: #7f1d1d; color: #fca5a5; }
+        .badge-queue { background: #1e293b; color: #94a3b8; }
+        .stats-grid { display: grid; grid-template-columns: repeat(4, 1fr); gap: 16px; margin-bottom: 20px; }
+        .stat-box { background: #090d16; border-radius: 12px; padding: 16px; border: 1px solid #1e293b; }
+        .stat-label { font-size: 11px; color: #94a3b8; text-transform: uppercase; margin-bottom: 6px; letter-spacing: 0.5px; }
+        .stat-val { font-size: 24px; font-weight: 800; color: #f8fafc; }
+        table { width: 100%; border-collapse: collapse; margin-top: 10px; font-size: 13px; }
+        th { text-align: left; padding: 12px 10px; color: #94a3b8; border-bottom: 1px solid #1e293b; font-size: 11px; text-transform: uppercase; letter-spacing: 0.5px; }
+        td { padding: 14px 10px; border-bottom: 1px solid #131b2e; color: #cbd5e1; }
+        tr:hover td { background: #17223b; }
+        .countdown { font-family: monospace; font-size: 14px; font-weight: 800; color: #38bdf8; background: #090d16; padding: 4px 8px; border-radius: 6px; border: 1px solid #1e293b; }
+        .progress-bar-bg { width: 100px; height: 6px; background: #1e293b; border-radius: 3px; overflow: hidden; margin-top: 4px; }
+        .progress-bar-fill { height: 100%; background: #38bdf8; border-radius: 3px; }
+        .footer { font-size: 12px; color: #64748b; margin-top: 24px; text-align: center; }
+    </style>
 </head>
 <body>
+    <div class="container">
+        <!-- Top Command Header -->
+        <div class="card">
+            <div class="header">
+                <h1 id="header_title">⚡ CONSO 5-ACCOUNT GOLDEN MATRIX COMMAND CENTER</h1>
+                <span class="badge badge-active" id="header_badge">5 OXYLABS SLOTS ONLINE • 24/7 CLOUD</span>
+            </div>
 
-  <div class="header">
-    <div class="title-group">
-      <h1><i class="fa-solid fa-bolt"></i> CONSO ZAP CLUSTER 2 <span class="badge-cluster">Oxylabs 5 Slots</span></h1>
-    </div>
-    <button onclick="location.reload()" style="background:transparent; border:1px solid var(--border); color:#fff; padding:8px 16px; border-radius:8px; cursor:pointer; font-family:'JetBrains Mono';"><i class="fa-solid fa-rotate-right"></i> Refresh</button>
-  </div>
+            <!-- Top Summary Stats -->
+            <div class="stats-grid">
+                <div class="stat-box">
+                    <div class="stat-label">Total Matrix Zaps</div>
+                    <div class="stat-val" style="color: #38bdf8;" id="total_matrix_zaps">Calculating...</div>
+                </div>
+                <div class="stat-box">
+                    <div class="stat-label">Today Matrix Progress</div>
+                    <div class="stat-val" style="color: #4ade80;" id="daily_matrix_zaps">Calculating...</div>
+                </div>
+                <div class="stat-box">
+                    <div class="stat-label">Active Nodes</div>
+                    <div class="stat-val" id="active_nodes">Connecting...</div>
+                </div>
+                <div class="stat-box">
+                    <div class="stat-label">Daily Safety Cap</div>
+                    <div class="stat-val" style="color: #fde047;" id="daily_safety_cap">Calculating...</div>
+                </div>
+            </div>
 
-  <div class="summary-grid">
-    <div class="stat-card">
-      <div class="stat-title">Total Zaps Mined</div>
-      <div class="stat-val" style="color:#38bdf8;">{{ state.summary.total_zaps }} ⚡</div>
-    </div>
-    <div class="stat-card">
-      <div class="stat-title">Daily Zaps (Today)</div>
-      <div class="stat-val" style="color:#10b981;">{{ state.summary.daily_zaps }} ⚡</div>
-    </div>
-    <div class="stat-card">
-      <div class="stat-title">Active Oxylabs Nodes</div>
-      <div class="stat-val" style="color:#fbbf24;">{{ state.summary.active_nodes }} / 5</div>
-    </div>
-  </div>
-
-  <h2 style="font-size: 16px; margin-bottom: 14px; color: var(--accent);"><i class="fa-solid fa-server"></i> Dedicated Oxylabs Proxy Slots</h2>
-  <div class="grid-nodes">
-    {% for acc_id, a in state.accounts.items() %}
-    <div class="node-card">
-      <div class="node-header">
-        <div class="node-title">{{ a.flag }} {{ a.name }}</div>
-        <div class="node-status {% if a.status == 'active' %}status-active{% elif a.status == 'daily_cap_reached' %}status-cap{% else %}status-waiting{% endif %}">
-          {{ a.status }}
+            <!-- Multi-Account Matrix Roster Table -->
+            <h3 style="margin: 20px 0 10px 0; font-size: 14px; color: #94a3b8; text-transform: uppercase; letter-spacing: 0.5px;">
+                💎 Multi-Account Node Roster (Oxylabs Dedicated IP Isolation)
+            </h3>
+            <table>
+                <thead>
+                    <tr>
+                        <th>Account</th>
+                        <th>Proxy / Location</th>
+                        <th>Total Zaps</th>
+                        <th>Today's Progress</th>
+                        <th>Rank / Streak</th>
+                        <th>Next Prompt In</th>
+                        <th>Status</th>
+                    </tr>
+                </thead>
+                <tbody id="matrix-body">
+                    <tr><td colspan="7" style="text-align: center; padding: 20px; color: #64748b;">Loading Matrix Nodes...</td></tr>
+                </tbody>
+            </table>
         </div>
-      </div>
-      <div class="data-row">
-        <span class="data-label">Email:</span>
-        <span class="data-val">{{ a.email or 'Pending Grabber Sync' }}</span>
-      </div>
-      <div class="data-row">
-        <span class="data-label">Oxylabs Proxy:</span>
-        <span class="data-val" style="color:#38bdf8;">{{ a.proxy }}</span>
-      </div>
-      <div class="data-row">
-        <span class="data-label">Daily Zaps:</span>
-        <span class="data-val" style="color:#10b981;">{{ a.daily_zaps }} / {{ a.daily_cap or '35.0' }} ⚡</span>
-      </div>
-      <div class="data-row">
-        <span class="data-label">Total Zaps:</span>
-        <span class="data-val">{{ a.total_zaps }} ⚡</span>
-      </div>
-      <div class="data-row">
-        <span class="data-label">Global Rank:</span>
-        <span class="data-val" style="color:#fbbf24;">#{{ a.rank or 'Unranked' }}</span>
-      </div>
-      <div class="data-row">
-        <span class="data-label">Streak / Boost:</span>
-        <span class="data-val">{{ a.streak }}d ({{ a.boost }}x)</span>
-      </div>
-      <div class="data-row">
-        <span class="data-label">Last Synced:</span>
-        <span class="data-val">{{ a.last_sync }} ({{ a.last_platform }})</span>
-      </div>
-    </div>
-    {% endfor %}
-  </div>
 
-  <div class="terminal-section">
-    <div class="terminal-header"><i class="fa-solid fa-terminal"></i> Live Cluster Activity Log</div>
-    <div class="terminal-body">
-      {% for h in state.history %}
-      <div class="log-line">
-        <span class="log-time">[{{ h.time }}]</span> {{ h.account }} &bull; {{ h.platform }} ({{ h.model }}) &bull; {{ h.tokens }} tok &bull; <span class="log-zap">{{ h.zaps }} Zaps</span>
-      </div>
-      {% endfor %}
-      {% if not state.history %}
-      <div class="log-line" style="color:#64748b;">No prompt turns recorded yet. Waiting for first session synchronization...</div>
-      {% endif %}
-    </div>
-  </div>
+        <!-- Global Activity Log -->
+        <div class="card">
+            <h3 style="margin: 0 0 14px 0; font-size: 14px; color: #94a3b8; text-transform: uppercase; letter-spacing: 0.5px;">
+                📜 Real-Time Multi-Node Activity Log
+            </h3>
+            <table>
+                <thead>
+                    <tr>
+                        <th>Time</th>
+                        <th>Node</th>
+                        <th>Platform</th>
+                        <th>Model</th>
+                        <th>Tokens</th>
+                        <th>Zaps Earned</th>
+                    </tr>
+                </thead>
+                <tbody id="history-body">
+                    <tr><td colspan="6" style="text-align: center; padding: 20px; color: #64748b;">Waiting for turns to log...</td></tr>
+                </tbody>
+            </table>
+        </div>
 
+        <div class="footer">
+            Dedicated Oxylabs Geo Routing: 🇺🇸 San Francisco / California (Ports 8001 - 8005) | 100% Anti-Sybil Isolation & WebRTC Leak Shield
+        </div>
+    </div>
+
+    <script>
+        let accountsData = {};
+
+        function getFlagHtml(country) {
+            if (!country || country === "??") return "🌐";
+            let c = country.toLowerCase();
+            return `<img src="https://flagcdn.com/20x15/${c}.png" width="20" height="15" alt="${country}" style="border-radius: 2px; vertical-align: middle; margin-right: 6px; box-shadow: 0 1px 3px rgba(0,0,0,0.4);" onerror="this.outerHTML='🌐'">`;
+        }
+
+        function formatCountdown(targetEpoch) {
+            let now = Math.floor(Date.now() / 1000);
+            let diff = targetEpoch - now;
+            if (diff <= 0) return "⚡ Syncing...";
+            let m = Math.floor(diff / 60);
+            let s = diff % 60;
+            return (m < 10 ? "0" : "") + m + "m " + (s < 10 ? "0" : "") + s + "s";
+        }
+
+        function updateTickers() {
+            for (let aid in accountsData) {
+                let el = document.getElementById("timer-" + aid);
+                if (el && accountsData[aid].next_sync_target) {
+                    el.innerText = formatCountdown(accountsData[aid].next_sync_target);
+                }
+            }
+        }
+
+        async function fetchMatrixState() {
+            try {
+                let res = await fetch("/health");
+                let data = await res.json();
+                if (data.ok && data.matrix) {
+                    let m = data.matrix;
+                    accountsData = m.accounts;
+
+                    let totalNodes = Object.keys(m.accounts).length;
+                    let totalTargetCap = 0;
+                    for (let aid in m.accounts) {
+                        totalTargetCap += Number(m.accounts[aid].daily_cap || 33.0);
+                    }
+                    let targetCap = totalTargetCap.toFixed(1);
+
+                    // Dynamic Titles & Badges
+                    document.title = `Conso ${totalNodes}-Account Golden Matrix Hub (Cluster 2)`;
+                    let headerTitleEl = document.getElementById("header_title");
+                    if (headerTitleEl) headerTitleEl.innerHTML = `⚡ CONSO ${totalNodes}-ACCOUNT GOLDEN MATRIX COMMAND CENTER`;
+                    let headerBadgeEl = document.getElementById("header_badge");
+                    if (headerBadgeEl) headerBadgeEl.innerText = `${totalNodes} OXYLABS SLOTS ONLINE • 24/7 CLOUD`;
+
+                    // Update Top Stats
+                    let totalZ = 0;
+                    let dailyZ = 0;
+                    let activeCount = 0;
+
+                    let tbody = document.getElementById("matrix-body");
+                    let rowsHtml = "";
+
+                    for (let aid in m.accounts) {
+                        let acc = m.accounts[aid];
+                        totalZ += Number(acc.total_zaps || 0);
+                        dailyZ += Number(acc.daily_zaps || 0);
+                        if (acc.status === "active") activeCount++;
+
+                        let cap = Number(acc.daily_cap || 33.0);
+                        let pct = Math.min(100, Math.round(((acc.daily_zaps || 0) / cap) * 100));
+                        let badgeClass = acc.is_sleeping ? "badge-sleep" : (acc.status === "daily_cap_reached" ? "badge-cap" : (acc.status.includes("err") ? "badge-err" : (acc.status === "staggered_queue" ? "badge-queue" : "badge-active")));
+                        let flag = getFlagHtml(acc.country || "US");
+
+                        rowsHtml += `
+                            <tr>
+                                <td><b>${flag} ${acc.name}</b><br><span style="font-size: 11px; color: #64748b;">${acc.email || ''}</span></td>
+                                <td style="font-size: 12px; color: #94a3b8;">${acc.country || 'US'} • ${acc.proxy.includes("@") ? acc.proxy.split("@")[1] : acc.proxy}</td>
+                                <td style="font-weight: bold; color: #38bdf8;">${Number(acc.total_zaps || 0).toFixed(2)}</td>
+                                <td>
+                                    <div>${Number(acc.daily_zaps || 0).toFixed(2)} / ${cap.toFixed(2)}</div>
+                                    <div class="progress-bar-bg"><div class="progress-bar-fill" style="width: ${pct}%;"></div></div>
+                                </td>
+                                <td>#${acc.rank || "..."} <span style="font-size: 11px; color: #94a3b8;">(${acc.streak || 1}d)</span></td>
+                                <td><span class="countdown" id="timer-${acc.id}">${formatCountdown(acc.next_sync_target || 0)}</span></td>
+                                <td><span class="badge ${badgeClass}">${acc.status}</span></td>
+                            </tr>
+                        `;
+                    }
+
+                    tbody.innerHTML = rowsHtml;
+                    document.getElementById("total_matrix_zaps").innerText = totalZ.toFixed(2);
+                    document.getElementById("daily_matrix_zaps").innerText = `${dailyZ.toFixed(2)} / ${targetCap}`;
+                    document.getElementById("active_nodes").innerText = `${activeCount} / ${totalNodes} Online`;
+                    let dailySafetyCapEl = document.getElementById("daily_safety_cap");
+                    if (dailySafetyCapEl) dailySafetyCapEl.innerText = `${targetCap} Zaps/Day`;
+
+                    // Update History Table
+                    if (m.history && m.history.length > 0) {
+                        let hbody = document.getElementById("history-body");
+                        hbody.innerHTML = m.history.map(h => {
+                            let hFlag = getFlagHtml(h.country || "US");
+                            let nodeTitle = h.name ? `${hFlag} ${h.name}` : (h.country ? `${hFlag} ${h.account.replace(/^[^ ]+ /, '')}` : (h.account || "Node"));
+                            return `
+                            <tr>
+                                <td>${h.time}</td>
+                                <td><b>${nodeTitle}</b></td>
+                                <td>${h.platform}</td>
+                                <td>${h.model}</td>
+                                <td>${h.tokens}</td>
+                                <td style="color: #4ade80; font-weight: bold;">${h.zaps}</td>
+                            </tr>
+                        `;
+                        }).join("");
+                    }
+                }
+            } catch (e) {
+                console.log("Fetch error:", e);
+            }
+        }
+
+        setInterval(updateTickers, 1000);
+        setInterval(fetchMatrixState, 4000);
+        fetchMatrixState();
+    </script>
 </body>
 </html>
 """

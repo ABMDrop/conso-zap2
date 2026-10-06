@@ -1,3 +1,6 @@
 __pycache__/
 *.pyc
 .env
+scan_and_save_vault.py
+push_to_vault.py
+
