@@ -1,0 +1,52 @@
+[
+  {
+    "id": "acc_01",
+    "name": "Cluster 2 Node 1",
+    "email": "",
+    "country": "US",
+    "flag": "🇺🇸",
+    "proxy": "http://KnoxDropz_NDdKd:KnoxDropz_NDdKd1@dc.oxylabs.io:8001",
+    "refresh_token": "",
+    "access_token": null
+  },
+  {
+    "id": "acc_02",
+    "name": "Cluster 2 Node 2",
+    "email": "",
+    "country": "US",
+    "flag": "🇺🇸",
+    "proxy": "http://KnoxDropz_NDdKd:KnoxDropz_NDdKd1@dc.oxylabs.io:8002",
+    "refresh_token": "",
+    "access_token": null
+  },
+  {
+    "id": "acc_03",
+    "name": "Cluster 2 Node 3",
+    "email": "",
+    "country": "US",
+    "flag": "🇺🇸",
+    "proxy": "http://KnoxDropz_NDdKd:KnoxDropz_NDdKd1@dc.oxylabs.io:8003",
+    "refresh_token": "",
+    "access_token": null
+  },
+  {
+    "id": "acc_04",
+    "name": "Cluster 2 Node 4",
+    "email": "",
+    "country": "US",
+    "flag": "🇺🇸",
+    "proxy": "http://KnoxDropz_NDdKd:KnoxDropz_NDdKd1@dc.oxylabs.io:8004",
+    "refresh_token": "",
+    "access_token": null
+  },
+  {
+    "id": "acc_05",
+    "name": "Cluster 2 Node 5",
+    "email": "",
+    "country": "US",
+    "flag": "🇺🇸",
+    "proxy": "http://KnoxDropz_NDdKd:KnoxDropz_NDdKd1@dc.oxylabs.io:8005",
+    "refresh_token": "",
+    "access_token": null
+  }
+]

@@ -1,0 +1,13 @@
+{
+  "supabase_url": "https://jzxlayjrsdbyzykuiqns.supabase.co",
+  "anon_key": "sb_publishable_clAiRg6ffCznEAtg_bn19Q_yY0W5Hyd",
+  "daily_cap": 36.0,
+  "daily_cap_min": 30.0,
+  "daily_cap_max": 35.0,
+  "min_interval_sec": 1200,
+  "max_interval_sec": 1800,
+  "enable_sleep_window": false,
+  "sleep_start_hour_utc": 21,
+  "sleep_end_hour_utc": 3,
+  "auto_claim_daily_checkin": true
+}
