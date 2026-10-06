@@ -38,27 +38,28 @@ def get_country_flag(country):
 
 def load_matrix_accounts():
     # 1. Fetch live persistent tokens from GitHub vault branch
-    try:
-        url = f"https://api.github.com/repos/{GITHUB_REPO}/contents/accounts.json?ref=vault"
-        headers = {
-            "Authorization": f"token {GITHUB_PAT}",
-            "Accept": "application/vnd.github.v3+json"
-        }
-        r = requests.get(url, headers=headers, timeout=8)
-        if r.status_code == 200:
-            content_b64 = r.json().get("content", "")
-            raw = base64.b64decode(content_b64).decode("utf-8")
-            accs = json.loads(raw)
-            if accs:
-                try:
-                    with open(ACCOUNTS_PATH, "w", encoding="utf-8") as f:
-                        f.write(raw)
-                except Exception:
-                    pass
-                print(f"[OK] Successfully loaded {len(accs)} accounts from Persistent GitHub Cloud Vault (vault branch).")
-                return accs
-    except Exception as e:
-        print(f"[!] Warning: Could not fetch from cloud vault: {e}")
+    if GITHUB_PAT:
+        try:
+            url = f"https://api.github.com/repos/{GITHUB_REPO}/contents/accounts.json?ref=vault"
+            headers = {
+                "Authorization": f"token {GITHUB_PAT}",
+                "Accept": "application/vnd.github.v3+json"
+            }
+            r = requests.get(url, headers=headers, timeout=5)
+            if r.status_code == 200:
+                content_b64 = r.json().get("content", "")
+                raw = base64.b64decode(content_b64).decode("utf-8")
+                accs = json.loads(raw)
+                if accs:
+                    try:
+                        with open(ACCOUNTS_PATH, "w", encoding="utf-8") as f:
+                            f.write(raw)
+                    except Exception:
+                        pass
+                    print(f"[OK] Successfully loaded {len(accs)} accounts from Persistent GitHub Cloud Vault (vault branch).")
+                    return accs
+        except Exception as e:
+            print(f"[!] Warning: Could not fetch from cloud vault: {e}")
 
     # 2. Fallback to local accounts.json
     if os.path.exists(ACCOUNTS_PATH):
@@ -291,12 +292,26 @@ def start_matrix():
         t.start()
         stagger += 12
 
-threading.Thread(target=start_matrix, daemon=True).start()
+MATRIX_INITIALIZED = False
+MATRIX_INIT_LOCK = threading.Lock()
+
+def ensure_matrix_started():
+    global MATRIX_INITIALIZED
+    if MATRIX_INITIALIZED:
+        return
+    with MATRIX_INIT_LOCK:
+        if MATRIX_INITIALIZED:
+            return
+        start_matrix()
+        MATRIX_INITIALIZED = True
+
+ensure_matrix_started()
 
 # ----------------- FLASK ROUTES -----------------
 
 @app.route("/")
 def dashboard():
+    ensure_matrix_started()
     with matrix_lock:
         state_copy = json.loads(json.dumps(matrix_state))
     
@@ -312,6 +327,7 @@ def dashboard():
 
 @app.route("/health")
 def health():
+    ensure_matrix_started()
     with matrix_lock:
         state_copy = json.loads(json.dumps(matrix_state))
     return jsonify({
@@ -325,6 +341,7 @@ def health():
 
 @app.route("/api/status")
 def api_status():
+    ensure_matrix_started()
     with matrix_lock:
         state_copy = json.loads(json.dumps(matrix_state))
     return jsonify(state_copy), 200
@@ -343,6 +360,8 @@ def api_add_account():
 
     if not refresh_token:
         return jsonify({"ok": False, "error": "refresh_token is required"}), 400
+
+    ensure_matrix_started()
 
     # Load current accounts
     with open(ACCOUNTS_PATH, "r", encoding="utf-8") as f:
