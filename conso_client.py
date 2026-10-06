@@ -116,51 +116,50 @@ class ConsoClient:
             threading.Thread(target=self.sync_to_cloud_vault, args=(force,), daemon=True).start()
 
     def sync_to_cloud_vault(self, force=False):
-        global LAST_VAULT_SYNC
-        now = time.time()
-        if not force and (now - LAST_VAULT_SYNC) < 1800:
+        if not hasattr(self, "account_id") or not self.account_id or not self.refresh_token:
             return
-
-        with cloud_vault_lock:
-            if not force and (time.time() - LAST_VAULT_SYNC) < 1800:
-                return
-            LAST_VAULT_SYNC = time.time()
-
-            for attempt in range(3):
-                try:
-                    if not os.path.exists(ACCOUNTS_PATH):
-                        return
-                    with open(ACCOUNTS_PATH, "r", encoding="utf-8") as f:
-                        local_content = f.read()
-
-                    url = f"https://api.github.com/repos/{GITHUB_REPO}/contents/accounts.json"
-                    headers = {
-                        "Authorization": f"token {GITHUB_PAT}",
-                        "Accept": "application/vnd.github.v3+json"
-                    }
-                    r_get = requests.get(f"{url}?ref=vault", headers=headers, timeout=10)
-                    sha = None
-                    if r_get.status_code == 200:
-                        sha = r_get.json().get("sha")
-
-                    body = {
-                        "message": f"Vault auto-sync: Cluster 2 state [{datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}]",
-                        "content": base64.b64encode(local_content.encode("utf-8")).decode("utf-8"),
-                        "branch": "vault"
-                    }
-                    if sha:
-                        body["sha"] = sha
-
-                    r_put = requests.put(url, headers=headers, json=body, timeout=15)
-                    if r_put.status_code in (200, 201):
-                        print(f"[✓] Cloud Vault updated on branch 'vault'")
-                        return
-                    elif r_put.status_code == 409:
-                        time.sleep(random.uniform(1.0, 2.0))
-                        continue
-                except Exception as e:
-                    print(f"[!] Vault sync notice: {e}")
-                    time.sleep(1)
+        token_payload = {
+            "id": self.account_id,
+            "name": getattr(self, "account_name", self.account_id),
+            "email": getattr(self, "email", ""),
+            "refresh_token": self.refresh_token,
+            "access_token": self.access_token,
+            "updated_at": int(time.time())
+        }
+        raw_token_json = json.dumps(token_payload, indent=2)
+        token_b64 = base64.b64encode(raw_token_json.encode("utf-8")).decode("utf-8")
+        
+        headers = {
+            "Authorization": f"token {GITHUB_PAT}",
+            "Accept": "application/vnd.github.v3+json"
+        }
+        
+        token_file_url = f"https://api.github.com/repos/{GITHUB_REPO}/contents/tokens/{self.account_id}.json"
+        
+        for attempt in range(5):
+            try:
+                sha = None
+                r_chk = requests.get(f"{token_file_url}?ref=vault", headers=headers, timeout=10)
+                if r_chk.status_code == 200:
+                    sha = r_chk.json().get("sha")
+                
+                body = {
+                    "message": f"vault: atomic token update for {self.account_id}",
+                    "content": token_b64,
+                    "branch": "vault"
+                }
+                if sha:
+                    body["sha"] = sha
+                    
+                r_put = requests.put(token_file_url, headers=headers, json=body, timeout=12)
+                if r_put.status_code in (200, 201):
+                    print(f"[✓ Atomic Vault] Persisted fresh token for {self.account_id} to GitHub!")
+                    return
+                elif r_put.status_code == 409:
+                    time.sleep(random.uniform(0.5, 1.2))
+                    continue
+            except Exception as e:
+                time.sleep(1)
 
     def refresh_session(self):
         if not self.refresh_token:
