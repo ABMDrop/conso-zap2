@@ -279,26 +279,48 @@ def account_worker(acc_data, initial_delay=0):
         except Exception as e:
             err_str = str(e)
             print(f"[!] Worker exception ({flag} {name}): {err_str}")
-            # Dynamic Self-Healing: If auth failed, reload latest tokens from cloud vault/disk
-            if "Session Refresh Failed" in err_str or "JWT expired" in err_str or "401" in err_str or "auth_err" in err_str:
+            healed = False
+            is_auth_error = any(k in err_str.lower() for k in [
+                "session refresh failed", "jwt expired", "401", "auth_err", 
+                "invalid refresh token", "token", "unauthorized", "already used"
+            ])
+            if is_auth_error:
+                # Dynamic Self-Healing: If auth failed, reload latest tokens from cloud vault/disk
                 try:
                     reloaded_accs = load_matrix_accounts()
                     for ra in reloaded_accs:
-                        if ra.get("id") == acc_id and ra.get("refresh_token") != client.refresh_token:
+                        if ra.get("id") == acc_id and ra.get("refresh_token") and ra.get("refresh_token") != client.refresh_token:
                             client.refresh_token = ra.get("refresh_token")
                             if ra.get("access_token"):
                                 client.access_token = ra.get("access_token")
+                            client.token_expiry = 0
                             print(f"[🔄] Self-healed {flag} {name} with fresh token from vault!")
+                            healed = True
                             with matrix_lock:
                                 if acc_id in matrix_state["accounts"]:
                                     matrix_state["accounts"][acc_id]["status"] = "active"
+                                    matrix_state["accounts"][acc_id]["next_sync_target"] = int(time.time() + 10)
                             break
                 except Exception as ex:
                     print(f"[!] Self-healing error for {name}: {ex}")
-            with matrix_lock:
-                if acc_id in matrix_state["accounts"]:
-                    matrix_state["accounts"][acc_id]["next_sync_target"] = int(time.time() + 180)
-            time.sleep(30)
+
+                if not healed:
+                    with matrix_lock:
+                        if acc_id in matrix_state["accounts"]:
+                            matrix_state["accounts"][acc_id]["status"] = "session_expired"
+                            matrix_state["accounts"][acc_id]["next_sync_target"] = 0
+                    time.sleep(120)
+                else:
+                    time.sleep(10)
+            else:
+                # Temporary network/proxy glitch: back off without resetting into infinite loop
+                retry_delay = random.randint(60, 90)
+                with matrix_lock:
+                    if acc_id in matrix_state["accounts"]:
+                        matrix_state["accounts"][acc_id]["status"] = "retrying"
+                        matrix_state["accounts"][acc_id]["next_sync_target"] = int(time.time() + retry_delay)
+                print(f"[⚠️] Temporary network blip for {name}: Backing off {retry_delay}s...")
+                time.sleep(retry_delay)
 
 # Self Keep-Alive Daemon
 def pinger_loop():
@@ -485,7 +507,10 @@ HTML_TEMPLATE = """
             return `<img src="https://flagcdn.com/20x15/${c}.png" width="20" height="15" alt="${country}" style="border-radius: 2px; vertical-align: middle; margin-right: 6px; box-shadow: 0 1px 3px rgba(0,0,0,0.4);" onerror="this.outerHTML='🌐'">`;
         }
 
-        function formatCountdown(targetEpoch) {
+        function formatCountdown(targetEpoch, status) {
+            if (status === "session_expired") return "⚠️ Expired";
+            if (status === "daily_cap_reached") return "💤 Cap Met";
+            if (!targetEpoch || targetEpoch <= 0) return "⚡ Ready";
             let now = Math.floor(Date.now() / 1000);
             let diff = targetEpoch - now;
             if (diff <= 0) return "⚡ Syncing...";
@@ -497,8 +522,9 @@ HTML_TEMPLATE = """
         function updateTickers() {
             for (let aid in accountsData) {
                 let el = document.getElementById("timer-" + aid);
-                if (el && accountsData[aid].next_sync_target) {
-                    el.innerText = formatCountdown(accountsData[aid].next_sync_target);
+                if (el) {
+                    let acc = accountsData[aid];
+                    el.innerText = formatCountdown(acc.next_sync_target || 0, acc.status);
                 }
             }
         }
@@ -541,7 +567,12 @@ HTML_TEMPLATE = """
 
                         let cap = Number(acc.daily_cap || 33.0);
                         let pct = Math.min(100, Math.round(((acc.daily_zaps || 0) / cap) * 100));
-                        let badgeClass = acc.is_sleeping ? "badge-sleep" : (acc.status === "daily_cap_reached" ? "badge-cap" : (acc.status.includes("err") ? "badge-err" : (acc.status === "staggered_queue" ? "badge-queue" : "badge-active")));
+                        let isExpired = acc.status === "session_expired";
+                        let isCap = acc.status === "daily_cap_reached";
+                        let badgeClass = acc.is_sleeping ? "badge-sleep" : (isCap ? "badge-cap" : (isExpired || acc.status.includes("err") ? "badge-err" : (acc.status === "staggered_queue" ? "badge-queue" : "badge-active")));
+                        let statusLabel = isExpired ? "SESSION EXPIRED" : (isCap ? "CAP REACHED" : (acc.is_sleeping ? "SLEEP MODE" : acc.status.toUpperCase()));
+                        let timerColor = isExpired ? "color: #f87171; border-color: #7f1d1d;" : (isCap ? "color: #fde047; border-color: #713f12;" : "");
+                        let timerHtml = `<span class="countdown" id="timer-${acc.id}" style="${timerColor}">${formatCountdown(acc.next_sync_target || 0, acc.status)}</span>`;
                         let flag = getFlagHtml(acc.country || "US");
 
                         rowsHtml += `
@@ -554,8 +585,8 @@ HTML_TEMPLATE = """
                                     <div class="progress-bar-bg"><div class="progress-bar-fill" style="width: ${pct}%;"></div></div>
                                 </td>
                                 <td>#${acc.rank || "..."} <span style="font-size: 11px; color: #94a3b8;">(${acc.streak || 1}d)</span></td>
-                                <td><span class="countdown" id="timer-${acc.id}">${formatCountdown(acc.next_sync_target || 0)}</span></td>
-                                <td><span class="badge ${badgeClass}">${acc.status}</span></td>
+                                <td>${timerHtml}</td>
+                                <td><span class="badge ${badgeClass}">${statusLabel}</span></td>
                             </tr>
                         `;
                     }

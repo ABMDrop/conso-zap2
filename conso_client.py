@@ -177,13 +177,16 @@ class ConsoClient:
             data = res.json()
             self.access_token = data.get("access_token")
             self.refresh_token = data.get("refresh_token")
+            self.token_expiry = time.time() + 3000  # 50 minutes cache
             self.save_config()
             return True
         else:
+            self.token_expiry = 0
             raise Exception(f"Session Refresh Failed ({res.status_code}): {res.text[:80]}")
 
     def get_auth_headers(self):
-        if not self.access_token:
+        now = time.time()
+        if not self.access_token or now >= getattr(self, "token_expiry", 0):
             self.refresh_session()
         headers = dict(BROWSER_HEADERS)
         headers.update({
@@ -203,6 +206,7 @@ class ConsoClient:
                 res = self.session.post(url, headers=headers, json=payload or {}, timeout=15)
             
             if res.status_code == 401 and retry_auth:
+                self.token_expiry = 0
                 self.refresh_session()
                 headers = self.get_auth_headers()
                 if method.upper() == "GET":
