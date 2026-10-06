@@ -40,76 +40,74 @@ GITHUB_PAT = os.environ.get("GITHUB_PAT", "")
 GITHUB_REPO = os.environ.get("GITHUB_REPO", "ABMDrop/conso-zap2")
 
 def load_matrix_accounts():
-    base_accs = []
+    accs = []
+    # 1. Load base accounts from local accounts.json
     if os.path.exists(ACCOUNTS_PATH):
         try:
             with open(ACCOUNTS_PATH, "r", encoding="utf-8") as f:
-                base_accs = json.load(f)
+                accs = json.load(f)
+        except Exception as e:
+            print(f"[!] Error reading accounts.json: {e}")
+
+    # Fallback: if accounts.json empty or missing, fetch from GitHub vault
+    if not accs:
+        try:
+            url = f"https://api.github.com/repos/{GITHUB_REPO}/contents/accounts.json?ref=vault"
+            headers = {"Authorization": f"token {GITHUB_PAT}", "Accept": "application/vnd.github.v3+json"}
+            r = requests.get(url, headers=headers, timeout=8)
+            if r.status_code == 200:
+                raw = base64.b64decode(r.json().get("content", "")).decode("utf-8")
+                accs = json.loads(raw)
+        except Exception as e:
+            print(f"[!] Error fetching fallback accounts from vault: {e}")
+
+    # 2. For each account, merge live token from dedicated tokens/{aid}.json on GitHub vault branch
+    headers = {"Authorization": f"token {GITHUB_PAT}", "Accept": "application/vnd.github.v3+json"}
+    tok_dir = os.path.join(os.path.dirname(ACCOUNTS_PATH), "tokens")
+    os.makedirs(tok_dir, exist_ok=True)
+
+    for acc in accs:
+        aid = acc.get("id")
+        if not aid:
+            continue
+        loaded_from_vault = False
+        try:
+            url = f"https://api.github.com/repos/{GITHUB_REPO}/contents/tokens/{aid}.json?ref=vault"
+            r = requests.get(url, headers=headers, timeout=6)
+            if r.status_code == 200:
+                raw = base64.b64decode(r.json().get("content", "")).decode("utf-8")
+                tok_data = json.loads(raw)
+                if tok_data.get("refresh_token"):
+                    acc["refresh_token"] = tok_data["refresh_token"]
+                if tok_data.get("access_token"):
+                    acc["access_token"] = tok_data["access_token"]
+                if tok_data.get("email"):
+                    acc["email"] = tok_data["email"]
+                # Cache locally
+                with open(os.path.join(tok_dir, f"{aid}.json"), "w", encoding="utf-8") as f:
+                    f.write(raw)
+                loaded_from_vault = True
         except Exception:
             pass
 
-    headers = {
-        "Authorization": f"token {GITHUB_PAT}",
-        "Accept": "application/vnd.github.v3+json"
-    }
-    
-    # 1. Fetch live atomic per-account tokens from GitHub vault (tokens/ folder)
-    tokens_synced = 0
-    try:
-        url_dir = f"https://api.github.com/repos/{GITHUB_REPO}/contents/tokens?ref=vault"
-        r_dir = requests.get(url_dir, headers=headers, timeout=8)
-        if r_dir.status_code == 200:
-            files_list = r_dir.json()
-            for f_item in files_list:
-                fname = f_item.get("name", "")
-                if fname.endswith(".json"):
-                    aid = fname.replace(".json", "")
-                    api_url = f_item.get("url")
-                    if api_url:
-                        raw_resp = requests.get(api_url, headers=headers, timeout=8)
-                        if raw_resp.status_code == 200:
-                            b64_c = raw_resp.json().get("content", "")
-                            t_data = json.loads(base64.b64decode(b64_c).decode("utf-8"))
-                            rt = t_data.get("refresh_token")
-                            at = t_data.get("access_token")
-                            if rt:
-                                for ba in base_accs:
-                                    if ba.get("id") == aid:
-                                        ba["refresh_token"] = rt
-                                        if at:
-                                            ba["access_token"] = at
-                                        tokens_synced += 1
-                                        break
-            if tokens_synced > 0:
-                print(f"[OK] Successfully loaded {tokens_synced} atomic tokens from GitHub Vault (tokens/ folder).")
+        if not loaded_from_vault:
+            # Fallback to local token file
+            local_tok = os.path.join(tok_dir, f"{aid}.json")
+            if os.path.exists(local_tok):
                 try:
-                    with open(ACCOUNTS_PATH, "w", encoding="utf-8") as f:
-                        json.dump(base_accs, f, indent=2)
+                    with open(local_tok, "r", encoding="utf-8") as f:
+                        tok_data = json.load(f)
+                        if tok_data.get("refresh_token"):
+                            acc["refresh_token"] = tok_data["refresh_token"]
+                        if tok_data.get("access_token"):
+                            acc["access_token"] = tok_data["access_token"]
+                        if tok_data.get("email"):
+                            acc["email"] = tok_data["email"]
                 except Exception:
                     pass
-                return base_accs
-    except Exception as e:
-        print(f"[!] Warning checking tokens/ in vault: {e}")
 
-    # 2. Fallback to monolithic accounts.json on vault branch
-    try:
-        url = f"https://api.github.com/repos/{GITHUB_REPO}/contents/accounts.json?ref=vault"
-        r = requests.get(url, headers=headers, timeout=8)
-        if r.status_code == 200:
-            content_b64 = r.json().get("content", "")
-            raw = base64.b64decode(content_b64).decode("utf-8")
-            accs = json.loads(raw)
-            if accs:
-                try:
-                    with open(ACCOUNTS_PATH, "w", encoding="utf-8") as f:
-                        f.write(raw)
-                except Exception:
-                    pass
-                return accs
-    except Exception as e:
-        print(f"[!] Warning: Could not fetch from cloud vault: {e}")
-
-    return base_accs
+    print(f"[OK] Successfully loaded {len(accs)} Cluster 2 accounts with dedicated token vaults.")
+    return accs
 
 def load_app_config():
     if os.path.exists(CONFIG_PATH):
@@ -324,46 +322,24 @@ def account_worker(acc_data, initial_delay=0):
                 "invalid refresh token", "token", "unauthorized", "already used"
             ])
             if is_auth_error:
-                # Dynamic Self-Healing: Check isolated atomic token file directly
+                # Dynamic Self-Healing: If auth failed, reload latest tokens from cloud vault/disk
                 try:
-                    tok_url = f"https://api.github.com/repos/{GITHUB_REPO}/contents/tokens/{acc_id}.json?ref=vault"
-                    r_tok = requests.get(tok_url, headers=headers, timeout=8)
-                    if r_tok.status_code == 200:
-                        raw = base64.b64decode(r_tok.json().get("content", "")).decode("utf-8")
-                        tok_data = json.loads(raw)
-                        vault_rt = tok_data.get("refresh_token")
-                        if vault_rt and vault_rt != client.refresh_token:
-                            client.refresh_token = vault_rt
-                            if tok_data.get("access_token"):
-                                client.access_token = tok_data.get("access_token")
+                    reloaded_accs = load_matrix_accounts()
+                    for ra in reloaded_accs:
+                        if ra.get("id") == acc_id and ra.get("refresh_token") and ra.get("refresh_token") != client.refresh_token:
+                            client.refresh_token = ra.get("refresh_token")
+                            if ra.get("access_token"):
+                                client.access_token = ra.get("access_token")
                             client.token_expiry = 0
-                            print(f"[🔄] Self-healed {flag} {name} from atomic token vault ({acc_id}.json)!")
+                            print(f"[🔄] Self-healed {flag} {name} with fresh token from vault!")
                             healed = True
                             with matrix_lock:
                                 if acc_id in matrix_state["accounts"]:
                                     matrix_state["accounts"][acc_id]["status"] = "active"
                                     matrix_state["accounts"][acc_id]["next_sync_target"] = int(time.time() + 10)
+                            break
                 except Exception as ex:
-                    print(f"[!] Atomic self-healing error for {name}: {ex}")
-
-                if not healed:
-                    try:
-                        reloaded_accs = load_matrix_accounts()
-                        for ra in reloaded_accs:
-                            if ra.get("id") == acc_id and ra.get("refresh_token") and ra.get("refresh_token") != client.refresh_token:
-                                client.refresh_token = ra.get("refresh_token")
-                                if ra.get("access_token"):
-                                    client.access_token = ra.get("access_token")
-                                client.token_expiry = 0
-                                print(f"[🔄] Self-healed {flag} {name} with fresh token from accounts list!")
-                                healed = True
-                                with matrix_lock:
-                                    if acc_id in matrix_state["accounts"]:
-                                        matrix_state["accounts"][acc_id]["status"] = "active"
-                                        matrix_state["accounts"][acc_id]["next_sync_target"] = int(time.time() + 10)
-                                break
-                    except Exception as ex:
-                        print(f"[!] Self-healing fallback error for {name}: {ex}")
+                    print(f"[!] Self-healing error for {name}: {ex}")
 
                 if not healed:
                     with matrix_lock:

@@ -112,48 +112,54 @@ class ConsoClient:
             except Exception:
                 pass
             
-            # Asynchronously sync to persistent GitHub vault branch with 30m debounce
-            threading.Thread(target=self.sync_to_cloud_vault, args=(force,), daemon=True).start()
+            # Asynchronously sync to persistent GitHub vault branch
+            threading.Thread(target=self.sync_to_cloud_vault, daemon=True).start()
 
-    def sync_to_cloud_vault(self, force=False):
-        if not hasattr(self, "account_id") or not self.account_id or not self.refresh_token:
-            return
-        token_payload = {
+    def sync_to_cloud_vault(self):
+        # 1. First save locally to tokens/{account_id}.json
+        tok_dir = os.path.join(os.path.dirname(ACCOUNTS_PATH), "tokens")
+        os.makedirs(tok_dir, exist_ok=True)
+        tok_file = os.path.join(tok_dir, f"{self.account_id}.json")
+        tok_payload = {
             "id": self.account_id,
-            "name": getattr(self, "account_name", self.account_id),
-            "email": getattr(self, "email", ""),
+            "name": self.account_name,
+            "email": self.email,
             "refresh_token": self.refresh_token,
             "access_token": self.access_token,
             "updated_at": int(time.time())
         }
-        raw_token_json = json.dumps(token_payload, indent=2)
-        token_b64 = base64.b64encode(raw_token_json.encode("utf-8")).decode("utf-8")
-        
-        headers = {
-            "Authorization": f"token {GITHUB_PAT}",
-            "Accept": "application/vnd.github.v3+json"
-        }
-        
-        token_file_url = f"https://api.github.com/repos/{GITHUB_REPO}/contents/tokens/{self.account_id}.json"
-        
-        for attempt in range(5):
+        try:
+            with open(tok_file, "w", encoding="utf-8") as f:
+                json.dump(tok_payload, f, indent=2)
+        except Exception:
+            pass
+
+        # 2. Sync directly to GitHub vault branch tokens/{self.account_id}.json (isolated per-account file)
+        for attempt in range(4):
             try:
+                url = f"https://api.github.com/repos/{GITHUB_REPO}/contents/tokens/{self.account_id}.json"
+                headers = {
+                    "Authorization": f"token {GITHUB_PAT}",
+                    "Accept": "application/vnd.github.v3+json"
+                }
+                r_get = requests.get(f"{url}?ref=vault", headers=headers, timeout=10)
                 sha = None
-                r_chk = requests.get(f"{token_file_url}?ref=vault", headers=headers, timeout=10)
-                if r_chk.status_code == 200:
-                    sha = r_chk.json().get("sha")
-                
+                if r_get.status_code == 200:
+                    sha = r_get.json().get("sha")
+
+                content_str = json.dumps(tok_payload, indent=2)
+                content_b64 = base64.b64encode(content_str.encode("utf-8")).decode("utf-8")
                 body = {
-                    "message": f"vault: atomic token update for {self.account_id}",
-                    "content": token_b64,
+                    "message": f"vault: atomic token update for {self.account_name} [{self.account_id}]",
+                    "content": content_b64,
                     "branch": "vault"
                 }
                 if sha:
                     body["sha"] = sha
-                    
-                r_put = requests.put(token_file_url, headers=headers, json=body, timeout=12)
+
+                r_put = requests.put(url, headers=headers, json=body, timeout=12)
                 if r_put.status_code in (200, 201):
-                    print(f"[✓ Atomic Vault] Persisted fresh token for {self.account_id} to GitHub!")
+                    print(f"[✓] Dedicated Token Vault updated for {self.account_name} ({self.account_id})")
                     return
                 elif r_put.status_code == 409:
                     time.sleep(random.uniform(0.5, 1.2))
