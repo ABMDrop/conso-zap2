@@ -64,11 +64,12 @@ def load_matrix_accounts():
                 fname = f_item.get("name", "")
                 if fname.endswith(".json"):
                     aid = fname.replace(".json", "")
-                    download_url = f_item.get("download_url")
-                    if download_url:
-                        raw_f = requests.get(download_url, headers=headers, timeout=8)
-                        if raw_f.status_code == 200:
-                            t_data = raw_f.json()
+                    api_url = f_item.get("url")
+                    if api_url:
+                        raw_resp = requests.get(api_url, headers=headers, timeout=8)
+                        if raw_resp.status_code == 200:
+                            b64_c = raw_resp.json().get("content", "")
+                            t_data = json.loads(base64.b64decode(b64_c).decode("utf-8"))
                             rt = t_data.get("refresh_token")
                             at = t_data.get("access_token")
                             if rt:
